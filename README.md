@@ -2,7 +2,7 @@
 
 Time-series forecasting of Poland's monthly unemployment rate (1997–2023) using R and the `fpp3` framework, comparing a seasonal naïve benchmark, SARIMA, ETS and dynamic regression with macroeconomic predictors.
 
-> MSc Business Administration and Data Science, Predictive Analytics exam project (Spring 2026). Group project of 4 students. See [Team & my contribution](#team--my-contribution).
+> MSc Business Administration and Data Science, Predictive Analytics exam project (Spring 2026). Group project of 4 students.
 
 ![Polish unemployment 12-month forecast](images/forecast_2024.png)
 
@@ -86,15 +86,10 @@ Four monthly, not seasonally adjusted series from [FRED](https://fred.stlouisfed
 
 R · fpp3 (`fable`, `feasts`, `tsibble`) · tidyverse · strucchange · tseries · urca · car · R Markdown
 
-## Team & my contribution
+## Team
 
-Group project by: <!-- add teammates' names / GitHub links, with their permission -->
-- Name 1
-- Name 2
-- Name 3
-- Name 4
+This was a team project by four students, completed as the final exam project for the Predictive Analytics course in the MSc Business Administration and Data Science programme (Spring 2026). The analysis, modelling and report were developed together as a group.
 
-**My contribution:** <!-- e.g. "Data collection from FRED, stationarity & structural-break analysis, dynamic regression models, and the Results section of the report." -->
 
 ---
 *Data: Federal Reserve Economic Data (FRED), Federal Reserve Bank of St. Louis.*
