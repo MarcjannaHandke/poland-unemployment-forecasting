@@ -1,0 +1,546 @@
+---
+title: "Forecasting the Unemployment Rate in Poland"
+author: "Group X"
+date: "May 2026"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_width: 7
+    fig_height: 4
+    highlight: tango
+  html_document:
+    toc: true
+    toc_depth: '2'
+    df_print: paged
+subtitle: Predictive Analytics — F26 Exam Project
+---
+
+```{r}
+#setting language to english (R reads the systems language and was displaying dates in polish)
+Sys.setlocale("LC_TIME", "English")
+
+#loading packages
+library(fpp3)          # main forecasting framework (fable, feasts, tsibble)
+library(tidyverse)
+library(corrplot)      # to create a corr matrix 
+library(readxl)        # to read the .xlsx
+library(knitr)         # kable for nicer tables
+library(strucchange)   # Sup-F / QLR structural-break tests
+library(lubridate)
+library(car)       # VIF checks on dynamic regression predictors
+library(tseries)   # for adf.test()
+library(urca)      # for ur.kpss()
+```
+
+```{r}
+#importing the dataset
+raw <- read_excel("data/PolandUnemploymentPrediction.xlsx", sheet = "Data")
+
+
+#converting into a tsibble indexed by year-month for easier analysis 
+data <- raw %>%
+  mutate(Month = yearmonth(Date)) %>%
+  select(Month, UnemploymentRate, EnergyPrice, EconomicActivity, JobVacancies) %>%
+  as_tsibble(index = Month)
+
+vars <- data.frame(data[,-1])
+```
+
+
+# Data
+
+## Sources and variables
+
+All series are sourced from the Federal Reserve Economic Data
+(FRED) repository.  The sample is **monthly** from
+January 1997 to January 2024 for the unemployment rate and predictors.
+
+```{r}
+#viewing the data
+head(data)
+tail(data)
+summary(data)
+```
+
+
+## Descriptive analysis and time-series plots
+
+```{r}
+#plotting dependant over time
+data %>%
+  autoplot(UnemploymentRate, colour = "#E63946", linewidth = 0.8) +
+  labs(x = NULL, y = "Unemployment rate (%)") +
+  theme_minimal()
+```
+
+```{r}
+#plotting predictors over time 
+data %>%
+  select(Month, EnergyPrice, EconomicActivity, JobVacancies) %>%
+  pivot_longer(-Month, names_to = "Series", values_to = "Value") %>%
+  ggplot(aes(Month, Value, colour = Series)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ Series, scales = "free_y", ncol = 3) +
+  scale_colour_manual(values = c(
+    "EnergyPrice"       = "chartreuse4",
+    "EconomicActivity"  = "#2A9D8F",
+    "TotalPriceIndex"   = "#E9C46A"
+  )) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+```{r}
+#checking basic statistics for all series
+summary(data)
+```
+```{r}
+#checking for na's
+table(is.na(data))
+
+#checking for any outliers 
+lapply(names(vars), function(x) {
+  boxplot(vars[[x]], main = x)
+})
+
+```
+EnergyPrice has a couple of minor outliers  but can be left as is, only two, very close to other values and are representing how it actually was. 
+
+## Transformation check (box-cox)
+Variance looks relatively stable but a downward trend is visible, box-cox test will formally determine if transformation is needed (lambda ≈ 0 suggests log, lambda ≈ 1 suggests none)
+
+```{r}
+lambda <- data %>%
+  features(UnemploymentRate, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+cat("Box-Cox lambda for UnemploymentRate:", round(lambda, 3), "\n")
+
+data %>%
+  autoplot(box_cox(UnemploymentRate, lambda), colour = "#E63946", linewidth = 0.8) +
+  labs(title = paste0("Box-Cox transformed Unemployment Rate (λ = ", round(lambda, 3), ")"),
+       x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+Lambda = 0.315, so it's in between, not close enough to 1 to skip transformation, not close enough to 0 for log. Best option would be just to use the lambda directly (Guerrero method) for the most precision. also fits what the plot suggested, some variance but nothing too severe
+
+```{r}
+#adding the transformed series as a new column
+data <- data %>%
+  mutate(UnemploymentRate_bc = box_cox(UnemploymentRate, lambda))
+
+#plotting it to show the effect
+data %>%
+  autoplot(UnemploymentRate_bc, colour = "#1D3557", linewidth = 0.8) +
+  labs(title = paste0("Box-Cox transformed Unemployment Rate (λ = ",
+                      round(lambda, 3), ")"),
+       x = NULL, y = "box_cox(rate, λ)") +
+  theme_minimal()
+```
+
+Now checking for predictors:
+```{r}
+data %>% features(EnergyPrice,     features = guerrero)
+data %>% features(EconomicActivity,      features = guerrero)
+data %>% features(JobVacancies,   features = guerrero)
+```
+
+
+
+## Seasonality and STL decomposition
+
+First, we need to check if there is any seasonality - if 1 then yes, if 0 means no 
+```{r}
+data %>%
+  pivot_longer(-Month, names_to = "Series", values_to = "Value") %>%
+  as_tsibble(index = Month, key = Series) %>%
+  features(Value, unitroot_nsdiffs) %>%
+  rename(Variable = Series, Seasonal_Diffs = nsdiffs) %>%
+  mutate(Seasonal_Unit_Root = ifelse(Seasonal_Diffs == 1, "Yes", "No")) %>%
+  kable(caption = "OCSB seasonal-unit-root test via unitroot_nsdiffs() — number of seasonal differences required.")
+```
+
+
+We can see that both UnemploymentRate and UnemploymentRate_bc have seasonality, so running STL decomposition
+
+```{r}
+data %>%
+  model(STL(UnemploymentRate_bc ~ trend(window = 21) + season(window = "periodic"))) %>%
+  components() %>%
+  autoplot() +
+  theme_minimal()
+```
+
+The decomposition confirms a clear annual seasonality of about $\pm 0.5$
+percentage points and a long-run trend that absorbs most of the variation.
+The remainder still shows clusters of volatility around 2008, 2020 and
+2022, which motivates a structural-break check.
+
+
+## Stationarity
+
+Both the unemployment rate and the predictors seem to non-stationary
+so we have to verify it using tests. We take the level a= 0.05 and then run KPSS and ADF tests. 
+
+```{r}
+# KPSS — H0: stationary. Small p-value => reject => non-stationary.
+data %>%
+  features(UnemploymentRate_bc, unitroot_kpss) %>%
+  kable(digits = 4,
+        caption = "KPSS test on Box-Cox transformed unemployment, in levels.")
+
+# ADF — H0: unit root. Small p-value => reject => stationary.
+adf.test(na.omit(data$UnemploymentRate_bc))
+```
+
+KPSS rejects stationarity in levels (small p-value), same with ADF (large p value >0.5). Even transformed dependent is non stationary (also seen on STL plot where the trend dominates). We need to find how many differences are needed for which we use uniroot_ndiffs and uniroot_nsdiffs to see the d and D. 
+
+```{r}
+data %>%
+  features(UnemploymentRate_bc, unitroot_ndiffs)   # how many regular diffs
+data %>%
+  features(UnemploymentRate_bc, unitroot_nsdiffs)  # how many seasonal diffs
+```
+
+The combined evidence suggests one regular difference ($d=1$) plus one
+seasonal difference ($D=1$) at lag 12 — a common SARIMA set-up for monthly
+labour data. Then I apply this to the data (by creating another set of new variables):
+
+```{r}
+data <- data %>%
+  mutate(
+    UnemploymentRate_sd  = difference(UnemploymentRate_bc, lag = 12),   # seasonal diff
+    UnemploymentRate_dsd = difference(UnemploymentRate_sd,    lag = 1)      # then regular diff
+  )
+
+# Visual check — the doubly-differenced series should look like noise
+data %>% autoplot(UnemploymentRate_dsd, colour = "#1D3557", linewidth = 0.6) +
+  labs(title = "Box-Cox unemployment, seasonally then regularly differenced",
+       x = NULL, y = NULL) + theme_minimal()
+```
+
+The plot looks good, it's been succesfully differenced, but we still test
+```{r}
+data %>%
+  features(UnemploymentRate_dsd, unitroot_kpss) %>%
+  kable(digits = 4,
+        caption = "KPSS test on seasonally + regularly differenced Box-Cox series.")
+
+adf.test(na.omit(data$UnemploymentRate_dsd))
+```
+Both tests confirm UnemploymentRate_dsd is stationary, KPSS doesn't reject and ADF rejects unit root. This series goes into ACF and PACF next
+Now the same thing for predictors (each predictor that enters a dynamic regression has to be stationary too, otherwise you get spurious-regression problems)
+
+Same situation for predictors, they also need to be stationary for dynamic regression, otherwise results can be misleading
+
+```{r}
+data %>%
+  pivot_longer(cols = c(EnergyPrice,
+                        EconomicActivity, JobVacancies),
+               names_to = "Series", values_to = "Value") %>%
+  as_tsibble(index = Month, key = Series) %>%
+  features(Value, list(unitroot_kpss, unitroot_ndiffs, unitroot_nsdiffs)) %>%
+  kable(digits = 4,
+        caption = "Stationarity diagnostics for each series (KPSS p-value, suggested regular and seasonal differences).")
+```
+
+Then apply the suggested differencing to each predictor (only if ndiffs or nsdiffs is > 0)
+
+```{r}
+data <- data %>%
+  mutate(
+    EnergyPrice_d       = difference(EnergyPrice,      lag = 1),
+    EconomicActivity_d  = difference(EconomicActivity, lag = 1),
+    JobVacancies_d      = difference(JobVacancies,     lag = 1)
+  )
+
+# Re-test KPSS on each differenced predictor
+data %>%
+  pivot_longer(cols = c(EnergyPrice_d, EconomicActivity_d, JobVacancies_d),
+               names_to = "Series", values_to = "Value") %>%
+  as_tsibble(index = Month, key = Series) %>%
+  features(Value, unitroot_kpss) %>%
+  kable(digits = 4,
+        caption = "KPSS test on differenced predictors.")
+```
+Differencing was succesful as well
+
+## Structural-break check
+
+We move into running Sup-F (QLR) test from strucchange on a simple AR(1) specification to check for structural breaks
+
+```{r}
+# Convert the differenced series to a base-R ts object
+y_ts  <- as.ts(na.omit(data$UnemploymentRate_dsd))
+y_lag <- stats::lag(y_ts, -1)
+
+# Align the two series
+df_break <- ts.intersect(y = y_ts, ylag = y_lag)
+
+# Compute F-statistic at every candidate break point (15% trim on each side)
+qlr <- Fstats(y ~ ylag, data = df_break, from = 0.15)
+
+# Sup-F test — H0: no break in the AR(1) specification
+sct <- sctest(qlr, type = "supF")
+print(sct)
+
+# Plot the F-stat curve with the maximising breakpoint marked
+plot(qlr, main = "Sup-F (QLR) over the sample — peaks indicate likely break dates")
+lines(breakpoints(qlr))
+```
+
+There is clearly one break in the middle of the sime series so around 2010, probably the one seen earlier in STL decomposition connected to 2008 market crash that heavily affected the unemployment. 
+
+```{r}
+bp_idx <- breakpoints(qlr)$breakpoints
+
+# +14 because we lost 12 NAs from seasonal diff + 1 from regular diff + 1 from lag()
+break_date <- data$Month[bp_idx + 14]
+
+tibble(`Largest break detected` = format(break_date),
+       `Sup-F statistic`        = round(sct$statistic, 3),
+       `p-value`                = signif(sct$p.value, 4)) %>%
+  kable(caption = "Sup-F (QLR) result on the differenced Box-Cox series.")
+```
+
+The Sup-F test points to a single statistically significant break in the
+mid-2010s, which aligns with the structural decline in Polish unemployment
+following the 2008 market crash. For the main analysis we retain the full sample, but discuss the robustness implications in Section 5.
+
+## ACF & PACF
+```{r}
+# ACF and PACF on the stationary series
+data %>%
+  gg_tsdisplay(UnemploymentRate_dsd, plot_type = "partial", lag = 36) +
+  theme_minimal()
+```
+```{r}
+data %>% gg_tsdisplay(difference(EnergyPrice),      plot_type = "partial", lag = 36)
+data %>% gg_tsdisplay(difference(EconomicActivity), plot_type = "partial", lag = 36)
+data %>% gg_tsdisplay(difference(JobVacancies),     plot_type = "partial", lag = 36)
+```
+
+
+
+
+## Assessing Predictor Quality 
+
+```{r}
+#correlation of variables 
+corrs <- cor(vars)
+
+corrplot(corrs, method = "color", 
+         addCoef.col = "white",
+         number.cex = 0.8,
+         tl.col = "black")
+```
+All three predictors negatively correlated with unemployment (-0.72 to -0.83) — higher activity, more vacancies, higher energy prices = lower unemployment, as expected. But predictors are also highly correlated with each other, especially EnergyPrice and EconomicActivity (0.94), which could cause multicollinearity issues
+
+# Methodology
+
+## train/test split 
+```{r}
+#splitting the data in the last 24 months of it 
+cutoff <- yearmonth("2021 Dec")
+train  <- data %>% filter(Month <= cutoff)
+test   <- data %>% filter(Month >  cutoff)
+
+c(train_obs = nrow(train), test_obs = nrow(test))
+```
+##VIF check to verify which variables are good for dynamic regression
+First we check if we can use all the predictors
+```{r}
+vif_fit_all <- lm(
+  UnemploymentRate_bc ~ EnergyPrice + EconomicActivity + JobVacancies,
+  data = train    # same training set used in fits %>% model(...)
+  )
+vif_vals1 <- vif(vif_fit_all)
+print(round(vif_vals1, 3))
+
+
+vif_fit_2 <- lm(
+  UnemploymentRate_bc ~ EnergyPrice + JobVacancies,
+  data = train
+  )
+vif_vals2 <- vif(vif_fit_2)
+print(round(vif_vals2, 3))
+
+vif_fit_3 <- lm(
+  UnemploymentRate_bc ~EconomicActivity + JobVacancies,
+  data = train
+)
+vif_vals3 <- vif(vif_fit_3)
+print(round(vif_vals3, 3))
+
+```
+
+## fitting all models on the training set - SNAIVE, SARIMA, ETS, and dynamic regression — for easy comparison
+
+```{r}
+fits <- train %>%
+  model(
+    snaive  = SNAIVE(UnemploymentRate_bc),
+    manual_sarima = ARIMA(UnemploymentRate_bc ~
+                          pdq(1, 1, 0) + PDQ(0, 1, 1)),
+    auto_sarima   = ARIMA(UnemploymentRate_bc,
+                          stepwise = FALSE, approximation = FALSE),
+    ets     = ETS(UnemploymentRate_bc),
+    dyn_reg_EJ = ARIMA(UnemploymentRate_bc ~
+                       EnergyPrice + JobVacancies,
+                       stepwise = FALSE, approximation = FALSE),
+    dyn_reg_AJ = ARIMA(UnemploymentRate_bc ~
+                       EconomicActivity + JobVacancies,
+                       stepwise = FALSE, approximation = FALSE)
+  )
+```
+
+## Residual diagnostics on each model 
+```{r}
+fits %>% select(auto_sarima)    %>% gg_tsresiduals()
+fits %>% select(manual_sarima)  %>% gg_tsresiduals()
+fits %>% select(ets)            %>% gg_tsresiduals()
+fits %>% select(dyn_reg_EJ)     %>% gg_tsresiduals()
+fits %>% select(dyn_reg_AJ)     %>% gg_tsresiduals()
+
+augment(fits) %>%
+  features(.innov, ljung_box, lag = 24) %>%
+  arrange(.model)
+```
+
+## Forecasting the predictors (dynamic regression)
+```{r}
+# Fit one ARIMA per predictor, each in its own mable
+fit_energy    <- train %>% model(ARIMA(EnergyPrice))
+fit_activity  <- train %>% model(ARIMA(EconomicActivity))
+fit_vacancies <- train %>% model(ARIMA(JobVacancies))
+
+# Forecast each one 24 months ahead
+fc_energy    <- fit_energy    %>% forecast(h = nrow(test))
+fc_activity  <- fit_activity  %>% forecast(h = nrow(test))
+fc_vacancies <- fit_vacancies %>% forecast(h = nrow(test))
+
+# Combine into one tsibble of future predictor values
+future_x <- tibble(
+  Month            = fc_energy$Month,
+  EnergyPrice      = fc_energy$.mean,
+  EconomicActivity = fc_activity$.mean,
+  JobVacancies     = fc_vacancies$.mean
+) %>%
+  as_tsibble(index = Month)
+```
+
+
+## Generating forecasts
+```{r}
+fc <- fits %>% forecast(new_data = future_x)
+
+acc <- fc %>%
+  accuracy(test) %>%
+  select(.model, RMSE, MAE, MAPE, ME) %>%
+  arrange(RMSE)
+
+acc %>% kable(
+  digits = 3,
+  caption = "Out-of-sample accuracy on the 24-month hold-out."
+)
+```
+The metrics to read:
+RMSE — penalises large errors, sensitive to outliers; the standard headline.
+MAPE — scale-free percent error; easy to interpret but breaks near zero.
+ME (mean error) — bias; tells you whether the model systematically over- or under-predicts.
+
+## Information criteria as a cross-check
+```{r}
+fits %>%
+  glance() %>%
+  select(.model, AIC, AICc, BIC) %>%
+  arrange(AICc)
+```
+
+
+## Verifying the best model and refitting on the full sample 
+```{r}
+## Verifying the best model and refitting on the full sample
+
+# --- 1. Full overlapping sample (no NAs) ---
+data_full <- data %>% drop_na(UnemploymentRate, EnergyPrice,
+                              EconomicActivity, JobVacancies)
+
+# --- 2. Stage 1: forecast each predictor 12 months ahead on the full sample ---
+fit_activity_full  <- data_full %>% model(ARIMA(EconomicActivity))
+fit_vacancies_full <- data_full %>% model(ARIMA(JobVacancies))
+
+fc_activity_full  <- fit_activity_full  %>% forecast(h = 12)
+fc_vacancies_full <- fit_vacancies_full %>% forecast(h = 12)
+
+future_x_final <- tibble(
+  Month            = fc_activity_full$Month,
+  EconomicActivity = fc_activity_full$.mean,
+  JobVacancies     = fc_vacancies_full$.mean
+) %>% as_tsibble(index = Month)
+
+# --- 3. Stage 2: refit dynamic regression on the full sample ---
+best <- data_full %>%
+  model(
+    dyn_reg_AJ = ARIMA(box_cox(UnemploymentRate, lambda) ~
+                       EconomicActivity + JobVacancies,
+                       stepwise = FALSE, approximation = FALSE)
+  )
+
+best %>% report()
+best %>% select(dyn_reg_AJ) %>% gg_tsresiduals()
+
+# --- 4. Stage 3: produce the 12-month unemployment forecast from each ---
+fc_final <- best %>% forecast(new_data = future_x_final)
+
+```
+```{r}
+# --- 5. Stage 4: visualise the forecast ---
+fc_tbl <- fc_final %>%
+  hilo(level = c(80, 95)) %>%
+  as_tibble() %>%
+  unpack_hilo(c("80%", "95%")) %>%
+  rename(lo80 = `80%_lower`, hi80 = `80%_upper`,
+         lo95 = `95%_lower`, hi95 = `95%_upper`)
+
+hist_tbl <- data_full %>%
+  filter(Month >= yearmonth("2015 Jan")) %>%
+  as_tibble() %>%
+  select(Month, UnemploymentRate)
+
+ggplot() +
+  geom_line(data = hist_tbl, aes(Month, UnemploymentRate)) +
+  geom_ribbon(data = fc_tbl, aes(Month, ymin = lo95, ymax = hi95),
+              fill = "steelblue", alpha = 0.2) +
+  geom_ribbon(data = fc_tbl, aes(Month, ymin = lo80, ymax = hi80),
+              fill = "steelblue", alpha = 0.35) +
+  geom_line(data = fc_tbl, aes(Month, .mean), colour = "steelblue", linewidth = 0.8) +
+  labs(
+    x = NULL,
+    y = "Unemployment rate (%)",
+    title = "Polish unemployment - 12-month forecast",
+    subtitle = "Dynamic regression on EconomicActivity + JobVacancies, refit on the full sample",
+    caption = "Shaded bands: 80% (darker) and 95% (lighter) prediction intervals"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+fc_tbl %>%
+  select(Month, .mean, lo80, hi80, lo95, hi95) %>%
+  kable(
+    digits = 2,
+    col.names = c("Month", "Forecast", "80% Lower", "80% Upper",
+                  "95% Lower", "95% Upper"),
+    caption = "12-month forecast of the Polish unemployment rate with 80% and 95% prediction intervals."
+  )
+```
+
+
+
+
